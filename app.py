@@ -124,6 +124,25 @@ def is_negative(sentiment: str) -> bool:
     return str(sentiment).lower().startswith("negative")
 
 
+def get_review_status(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "N/A"
+
+    negative_share = df["sentiment"].apply(is_negative).mean() * 100
+    positive_share = 100 - negative_share
+
+    if positive_share >= 80:
+        return "Very Positive"
+    elif positive_share >= 70:
+        return "Mostly Positive"
+    elif positive_share >= 40:
+        return "Mixed"
+    elif positive_share >= 20:
+        return "Mostly Negative"
+    else:
+        return "Very Negative"
+
+
 def assign_priority(sentiment: str, issue_category: str) -> str:
     if is_negative(sentiment) and issue_category in [
         "Bug / Crash",
@@ -206,6 +225,7 @@ def generate_summary(df: pd.DataFrame) -> str:
 
     negative_count = int(df["sentiment"].apply(is_negative).sum())
     negative_share = negative_count / total * 100
+    review_status = get_review_status(df)
 
     high_priority = int((df["priority"] == "High").sum())
 
@@ -238,7 +258,8 @@ def generate_summary(df: pd.DataFrame) -> str:
         )
 
     return (
-        f"Among {total:,} analyzed reviews, {negative_share:.1f}% are classified as negative. "
+        f"Among {total:,} analyzed reviews, the recent review status is **{review_status}**, "
+        f"with {negative_share:.1f}% classified as negative. "
         f"The most frequent issue category is {top_issue}, accounting for {top_issue_share:.1f}% of all analyzed reviews. "
         f"The app identified {high_priority:,} high-priority reviews that may require developer attention. "
         f"{focus_sentence} {praise_sentence}"
@@ -248,24 +269,25 @@ def generate_summary(df: pd.DataFrame) -> str:
 def render_kpi_cards(df: pd.DataFrame):
     total = len(df)
     negative_share = df["sentiment"].apply(is_negative).mean() * 100 if total else 0
+    positive_share = 100 - negative_share if total else 0
     high_priority = int((df["priority"] == "High").sum()) if total else 0
-    top_issue = df["issue_category"].value_counts().index[0] if total else "N/A"
+    review_status = get_review_status(df)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Reviews", f"{total:,}")
-    c2.metric("Negative Share", f"{negative_share:.1f}%")
+    c2.metric("Positive Share", f"{positive_share:.1f}%")
     c3.metric("High Priority", f"{high_priority:,}")
-    c4.metric("Top Issue", top_issue)
+    c4.metric("Recent Review Status", review_status)
 
 
-def render_interactive_filters(df: pd.DataFrame) -> pd.DataFrame:
+def render_interactive_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     if df.empty:
         return df
 
     st.subheader("Interactive Review Explorer")
     st.write(
         "Use the filters below to focus on a specific issue category, sentiment group, or priority level. "
-        "The dashboard and detailed results will update automatically."
+        "The dashboard and detailed results will update automatically without fetching the reviews again."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -275,13 +297,25 @@ def render_interactive_filters(df: pd.DataFrame) -> pd.DataFrame:
     priority_options = ["All"] + [x for x in PRIORITY_ORDER if x in set(df["priority"])]
 
     with col1:
-        selected_issue = st.selectbox("Issue Category", issue_options)
+        selected_issue = st.selectbox(
+            "Issue Category",
+            issue_options,
+            key=f"{key_prefix}_issue_filter",
+        )
 
     with col2:
-        selected_sentiment = st.selectbox("Sentiment", sentiment_options)
+        selected_sentiment = st.selectbox(
+            "Sentiment",
+            sentiment_options,
+            key=f"{key_prefix}_sentiment_filter",
+        )
 
     with col3:
-        selected_priority = st.selectbox("Priority", priority_options)
+        selected_priority = st.selectbox(
+            "Priority",
+            priority_options,
+            key=f"{key_prefix}_priority_filter",
+        )
 
     filtered_df = df.copy()
 
@@ -384,12 +418,12 @@ def render_charts(df: pd.DataFrame):
         st.plotly_chart(fig, use_container_width=True)
 
 
-def render_analysis_results(df: pd.DataFrame):
+def render_analysis_results(df: pd.DataFrame, key_prefix: str):
     st.subheader("Executive Summary")
     render_kpi_cards(df)
     st.write(generate_summary(df))
 
-    filtered_df = render_interactive_filters(df)
+    filtered_df = render_interactive_filters(df, key_prefix=key_prefix)
 
     if filtered_df.empty:
         st.warning("No reviews match the selected filters.")
@@ -408,6 +442,7 @@ def render_analysis_results(df: pd.DataFrame):
         data=csv_bytes,
         file_name="filtered_analyzed_reviews.csv",
         mime="text/csv",
+        key=f"{key_prefix}_download_filtered",
     )
 
     with st.expander("Show all analyzed results"):
@@ -420,6 +455,7 @@ def render_analysis_results(df: pd.DataFrame):
             data=all_csv_bytes,
             file_name="all_analyzed_reviews.csv",
             mime="text/csv",
+            key=f"{key_prefix}_download_all",
         )
 
 
@@ -521,6 +557,16 @@ except Exception as exc:
     st.stop()
 
 
+if "steam_result_df" not in st.session_state:
+    st.session_state["steam_result_df"] = None
+
+if "steam_app_id" not in st.session_state:
+    st.session_state["steam_app_id"] = None
+
+if "csv_result_df" not in st.session_state:
+    st.session_state["csv_result_df"] = None
+
+
 tab_steam, tab_csv, tab_about = st.tabs(
     [
         "Fetch by Steam App ID",
@@ -558,7 +604,9 @@ with tab_steam:
             "For classroom demos, 100–200 reviews is safer."
         )
 
-    if st.button("Fetch and Analyze Steam Reviews", type="primary"):
+    fetch_clicked = st.button("Fetch and Analyze Steam Reviews", type="primary")
+
+    if fetch_clicked:
         try:
             with st.spinner("Fetching recent Steam reviews..."):
                 fetched_df = fetch_steam_reviews_by_app_id(
@@ -568,6 +616,8 @@ with tab_steam:
 
             if fetched_df.empty:
                 st.warning("No reviews found. Please check the App ID or try CSV upload.")
+                st.session_state["steam_result_df"] = None
+                st.session_state["steam_app_id"] = None
             else:
                 st.success(f"Fetched {len(fetched_df):,} reviews from Steam App ID {app_id}.")
 
@@ -587,7 +637,8 @@ with tab_steam:
                         axis=1,
                     )
 
-                render_analysis_results(result_df)
+                st.session_state["steam_result_df"] = result_df
+                st.session_state["steam_app_id"] = app_id
 
         except Exception as exc:
             st.error(
@@ -595,6 +646,17 @@ with tab_steam:
                 "try a smaller number of reviews, or use CSV upload."
             )
             st.exception(exc)
+
+    if st.session_state["steam_result_df"] is not None:
+        st.divider()
+        st.caption(
+            f"Showing stored analysis results for Steam App ID "
+            f"{st.session_state['steam_app_id']}. Changing filters below will not fetch reviews again."
+        )
+        render_analysis_results(
+            st.session_state["steam_result_df"],
+            key_prefix="steam",
+        )
 
 
 with tab_csv:
@@ -634,6 +696,7 @@ Optional columns such as `app_name`, `review_score`, or `review_votes` can be in
         data=sample_csv,
         file_name="sample_review_upload.csv",
         mime="text/csv",
+        key="download_sample_csv",
     )
 
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
@@ -657,7 +720,9 @@ Optional columns such as `app_name`, `review_score`, or `review_votes` can be in
 
                 st.write(f"Loaded {len(input_df):,} reviews for analysis.")
 
-                if st.button("Analyze Uploaded Reviews", type="primary"):
+                analyze_csv_clicked = st.button("Analyze Uploaded Reviews", type="primary")
+
+                if analyze_csv_clicked:
                     with st.spinner("Running sentiment and issue category models..."):
                         result_df = analyze_texts(
                             input_df["review_text"].tolist(),
@@ -677,11 +742,21 @@ Optional columns such as `app_name`, `review_score`, or `review_votes` can be in
                             axis=1,
                         )
 
-                    render_analysis_results(result_df)
+                    st.session_state["csv_result_df"] = result_df
 
         except Exception as exc:
             st.error("Failed to read or analyze the uploaded CSV.")
             st.exception(exc)
+
+    if st.session_state["csv_result_df"] is not None:
+        st.divider()
+        st.caption(
+            "Showing stored CSV analysis results. Changing filters below will not re-run the model."
+        )
+        render_analysis_results(
+            st.session_state["csv_result_df"],
+            key_prefix="csv",
+        )
 
 
 with tab_about:
@@ -707,7 +782,7 @@ The fine-tuned DistilBERT model performed better for sentiment classification.
 For issue category classification, TF-IDF + Logistic Regression was selected because it outperformed the fine-tuned DistilBERT issue model under the limited training setting. This is also reasonable because the issue labels were generated through keyword-based weak labeling, making sparse keyword features effective for this task.
 
 ### Interactive analysis
-The dashboard includes filters for issue category, sentiment, and priority level. After selecting a filter, the charts and detailed review table update automatically, so users can inspect only the reviews related to a specific issue or sentiment group.
+The dashboard includes filters for issue category, sentiment, and priority level. After selecting a filter, the charts and detailed review table update automatically using the stored analysis results, without fetching reviews again.
 
 ### App outputs
 The app provides:
