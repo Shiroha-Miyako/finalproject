@@ -1,6 +1,6 @@
-import os
-import re
-from pathlib import Path
+import io
+import time
+from typing import List
 
 import joblib
 import numpy as np
@@ -8,324 +8,567 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-from transformers import pipeline
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 
-st.set_page_config(
-    page_title="Game Review Intelligence Assistant",
-    page_icon="🎮",
-    layout="wide",
-)
+# =========================
+# Configuration
+# =========================
+SENTIMENT_MODEL_ID = "ShirohaNaruse/game-review-sentiment-distilbert"
 
-SENTIMENT_MODEL_ID = os.getenv(
-    "SENTIMENT_MODEL_ID",
-    "ShirohaNaruse/game-review-sentiment-distilbert",
-)
-ISSUE_MODEL_FILE = Path("final_issue_tfidf_logreg.joblib")
-ISSUE_LABEL_MAPPING_FILE = Path("final_issue_label_mapping.csv")
+ISSUE_MODEL_FILE = "final_issue_tfidf_logreg.joblib"
+ISSUE_LABEL_MAPPING_FILE = "final_issue_label_mapping.csv"
 
-DEFAULT_ID2ISSUE = {
-    0: "Bug / Crash",
-    1: "Multiplayer / Server",
-    2: "Performance",
-    3: "Gameplay",
-    4: "Content",
-    5: "Price / Value",
-    6: "Praise / Strength",
+APP_TITLE = "Steam Review Intelligence Assistant"
+FETCH_MAX_REVIEWS = 1000
+
+ISSUE_ORDER = [
+    "Bug / Crash",
+    "Multiplayer / Server",
+    "Performance",
+    "Gameplay",
+    "Content",
+    "Price / Value",
+    "Praise / Strength",
+]
+
+PRIORITY_ORDER = ["High", "Medium", "Marketing Insight", "Low"]
+
+SENTIMENT_LABEL_MAP = {
+    "LABEL_0": "Negative / Not Recommended",
+    "LABEL_1": "Positive / Recommended",
+    0: "Negative / Not Recommended",
+    1: "Positive / Recommended",
+    "0": "Negative / Not Recommended",
+    "1": "Positive / Recommended",
+    "NEGATIVE": "Negative / Not Recommended",
+    "POSITIVE": "Positive / Recommended",
 }
 
-ISSUE_KEYWORDS = {
-    "Bug / Crash": [
-        "crash", "crashes", "crashing", "bug", "bugs", "buggy", "broken",
-        "won't launch", "won't start", "black screen", "freezes", "freezing",
-        "not working", "stuck on the loading screen", "save system", "lose progress",
-    ],
-    "Performance": [
-        "lag", "laggy", "stutter", "stuttering", "low fps", "frame rate",
-        "framerate", "optimization", "runs poorly", "sluggish", "unplayable",
-    ],
-    "Gameplay": [
-        "controls", "clunky", "boring", "repetitive", "unbalanced",
-        "too hard", "too easy", "difficulty", "hit detection", "combat",
-    ],
-    "Content": [
-        "too short", "short campaign", "lack of content", "not much to do",
-        "nothing to do", "story", "ending", "side missions", "dlc", "update", "patch",
-    ],
-    "Price / Value": [
-        "sale", "full price", "worth", "not worth", "waste of money",
-        "overpriced", "refund", "money back", "cheap",
-    ],
-    "Multiplayer / Server": [
-        "server", "servers", "multiplayer", "online", "disconnect", "disconnects",
-        "can't join", "dead community", "no online players", "player base",
-    ],
-    "Praise / Strength": [
-        "highly recommend", "recommended", "masterpiece", "classic", "gem",
-        "great soundtrack", "great music", "compelling story", "addictive", "immersive",
-        "charming", "solid game",
-    ],
+ACTION_MAP = {
+    "Bug / Crash": "Prioritize bug fixing and investigate crash logs or broken gameplay flows.",
+    "Performance": "Optimize FPS, loading time, memory usage, and hardware compatibility.",
+    "Gameplay": "Review core mechanics, controls, difficulty balance, and progression design.",
+    "Content": "Consider adding more levels, missions, story content, updates, or replay value.",
+    "Price / Value": "Review pricing, discount strategy, refund reasons, and perceived content value.",
+    "Multiplayer / Server": "Improve server stability, matchmaking, connection quality, and anti-cheat systems.",
+    "Praise / Strength": "Use this feedback to identify marketing messages and core product strengths.",
+    "General": "Review manually if the comment receives many votes or appears in negative feedback.",
 }
 
 
-def normalize_text(text: str) -> str:
-    text = str(text).lower().replace("’", "'")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+# =========================
+# Model loading
+# =========================
+@st.cache_resource(show_spinner=True)
+def load_sentiment_model():
+    sentiment_tokenizer = AutoTokenizer.from_pretrained(SENTIMENT_MODEL_ID)
+    sentiment_tokenizer.model_input_names = ["input_ids", "attention_mask"]
+    sentiment_model = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL_ID)
 
-
-def fallback_issue_tag(text: str) -> str:
-    normalized = normalize_text(text)
-    scores = {}
-    for category, keywords in ISSUE_KEYWORDS.items():
-        score = sum(1 for keyword in keywords if keyword in normalized)
-        if score > 0:
-            scores[category] = score
-    if not scores:
-        return "General"
-    return max(scores, key=scores.get)
-
-
-@st.cache_resource(show_spinner=False)
-def load_sentiment_pipeline():
-    return pipeline(
-        task="text-classification",
-        model=SENTIMENT_MODEL_ID,
-        tokenizer=SENTIMENT_MODEL_ID,
+    sentiment_pipe = pipeline(
+        "text-classification",
+        model=sentiment_model,
+        tokenizer=sentiment_tokenizer,
         truncation=True,
         max_length=256,
     )
+    return sentiment_pipe
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=True)
 def load_issue_model():
-    if not ISSUE_MODEL_FILE.exists():
-        return None
-    return joblib.load(ISSUE_MODEL_FILE)
+    issue_model = joblib.load(ISSUE_MODEL_FILE)
 
-
-@st.cache_data(show_spinner=False)
-def load_issue_mapping():
-    if not ISSUE_LABEL_MAPPING_FILE.exists():
-        return DEFAULT_ID2ISSUE
     mapping_df = pd.read_csv(ISSUE_LABEL_MAPPING_FILE)
     if "label" not in mapping_df.columns:
-        return DEFAULT_ID2ISSUE
-    category_col = "primary_issue_category" if "primary_issue_category" in mapping_df.columns else "category"
-    if category_col not in mapping_df.columns:
-        return DEFAULT_ID2ISSUE
-    return dict(zip(mapping_df["label"].astype(int), mapping_df[category_col].astype(str)))
+        raise ValueError("Issue label mapping file must contain a 'label' column.")
+
+    if "primary_issue_category" in mapping_df.columns:
+        category_col = "primary_issue_category"
+    elif "category" in mapping_df.columns:
+        category_col = "category"
+    else:
+        raise ValueError(
+            "Issue label mapping file must contain 'primary_issue_category' or 'category'."
+        )
+
+    mapping_df["label"] = mapping_df["label"].astype(int)
+    id2issue = dict(zip(mapping_df["label"], mapping_df[category_col].astype(str)))
+    return issue_model, id2issue
 
 
-def sentiment_from_output(output: dict) -> tuple[str, float]:
-    label = str(output.get("label", "")).upper()
-    score = float(output.get("score", 0.0))
-    if label in {"LABEL_1", "POSITIVE", "1"}:
-        return "Positive", score
-    if label in {"LABEL_0", "NEGATIVE", "0"}:
-        return "Negative", score
-    return label.title(), score
+# =========================
+# Utility functions
+# =========================
+def normalize_sentiment_label(raw_label):
+    return SENTIMENT_LABEL_MAP.get(raw_label, SENTIMENT_LABEL_MAP.get(str(raw_label), str(raw_label)))
 
 
-def predict_issue(text: str, issue_model, id2issue: dict[int, str]) -> str:
-    if issue_model is None:
-        return fallback_issue_tag(text)
-    raw_label = issue_model.predict([text])[0]
-    try:
-        return id2issue[int(raw_label)]
-    except Exception:
-        return str(raw_label)
+def is_negative(sentiment: str) -> bool:
+    return str(sentiment).lower().startswith("negative")
 
 
 def assign_priority(sentiment: str, issue_category: str) -> str:
-    if sentiment == "Negative" and issue_category in {"Bug / Crash", "Performance", "Multiplayer / Server"}:
+    if is_negative(sentiment) and issue_category in ["Bug / Crash", "Performance", "Multiplayer / Server"]:
         return "High"
-    if sentiment == "Negative" and issue_category in {"Gameplay", "Content", "Price / Value"}:
+    if is_negative(sentiment) and issue_category in ["Gameplay", "Content", "Price / Value"]:
         return "Medium"
-    if sentiment == "Positive" and issue_category == "Praise / Strength":
+    if (not is_negative(sentiment)) and issue_category == "Praise / Strength":
         return "Marketing Insight"
     return "Low"
 
 
-def suggest_action(issue_category: str, sentiment: str, priority: str) -> str:
-    if issue_category == "Bug / Crash":
-        return "Check crash reports, reproduce the issue, and prioritize a stability patch."
-    if issue_category == "Performance":
-        return "Review optimization issues such as FPS drops, loading time, and hardware-specific problems."
-    if issue_category == "Multiplayer / Server":
-        return "Monitor server stability, matchmaking, online connectivity, and player population complaints."
-    if issue_category == "Gameplay":
-        return "Review complaints about controls, balance, difficulty, and repetitive mechanics."
-    if issue_category == "Content":
-        return "Check whether players mention lack of content, story weakness, short playtime, or update expectations."
-    if issue_category == "Price / Value":
-        return "Review pricing, discount strategy, refund complaints, and perceived value for money."
-    if issue_category == "Praise / Strength":
-        return "Use this as positive feedback for marketing messages, store-page copy, or community posts."
-    if sentiment == "Negative":
-        return "Review this negative feedback manually and decide whether it points to a product issue."
-    return "Use this feedback as general player opinion for monitoring."
+def get_suggested_action(issue_category: str) -> str:
+    return ACTION_MAP.get(issue_category, ACTION_MAP["General"])
 
 
-def analyze_reviews(texts: list[str], batch_size: int = 16) -> pd.DataFrame:
-    clean_texts = [str(text) if pd.notna(text) else "" for text in texts]
-    sentiment_pipe = load_sentiment_pipeline()
-    issue_model = load_issue_model()
-    id2issue = load_issue_mapping()
+def predict_issue(issue_model, id2issue, clean_texts: List[str]):
+    issue_labels = issue_model.predict(clean_texts)
+
+    if hasattr(issue_model, "predict_proba"):
+        issue_probabilities = issue_model.predict_proba(clean_texts)
+        issue_confidences = np.max(issue_probabilities, axis=1)
+    else:
+        issue_confidences = np.ones(len(issue_labels))
+
+    issue_categories = [id2issue.get(int(label), str(label)) for label in issue_labels]
+    return issue_categories, issue_confidences
+
+
+def analyze_texts(texts: List[str], sentiment_pipe, issue_model, id2issue, batch_size: int = 16) -> pd.DataFrame:
+    clean_texts = [str(x) if pd.notna(x) else "" for x in texts]
+    clean_texts = [x.strip() for x in clean_texts]
 
     sentiment_outputs = sentiment_pipe(clean_texts, batch_size=batch_size)
+    issue_categories, issue_confidences = predict_issue(issue_model, id2issue, clean_texts)
 
     rows = []
-    for text, output in zip(clean_texts, sentiment_outputs):
-        sentiment, confidence = sentiment_from_output(output)
-        issue_category = predict_issue(text, issue_model, id2issue)
-        priority = assign_priority(sentiment, issue_category)
+    for text, s_out, issue, issue_conf in zip(clean_texts, sentiment_outputs, issue_categories, issue_confidences):
+        sentiment = normalize_sentiment_label(s_out.get("label"))
+        priority = assign_priority(sentiment, issue)
         rows.append(
             {
                 "review_text": text,
                 "sentiment": sentiment,
-                "sentiment_confidence": round(confidence, 4),
-                "issue_category": issue_category,
+                "sentiment_confidence": round(float(s_out.get("score", 0)), 4),
+                "issue_category": issue,
+                "issue_confidence": round(float(issue_conf), 4),
                 "priority": priority,
-                "suggested_action": suggest_action(issue_category, sentiment, priority),
+                "suggested_action": get_suggested_action(issue),
             }
         )
+
     return pd.DataFrame(rows)
 
 
-def fetch_steam_reviews(app_id: str, num_reviews: int = 200) -> pd.DataFrame:
-    url = f"https://store.steampowered.com/appreviews/{app_id}"
-    params = {
-        "json": 1,
-        "filter": "recent",
-        "language": "english",
-        "review_type": "all",
-        "purchase_type": "all",
-        "num_per_page": min(num_reviews, 100),
-    }
+def generate_summary(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "No reviews were analyzed."
 
-    reviews = []
-    cursor = "*"
-    while len(reviews) < num_reviews:
-        params["cursor"] = cursor
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        batch = data.get("reviews", [])
-        if not batch:
-            break
-        for item in batch:
-            reviews.append(item.get("review", ""))
-            if len(reviews) >= num_reviews:
-                break
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-    return pd.DataFrame({"review_text": reviews})
+    total = len(df)
+    negative_count = int(df["sentiment"].apply(is_negative).sum())
+    negative_share = negative_count / total * 100
+    high_priority = int((df["priority"] == "High").sum())
 
+    issue_counts = df["issue_category"].value_counts()
+    top_issue = issue_counts.index[0] if not issue_counts.empty else "N/A"
+    top_issue_share = issue_counts.iloc[0] / total * 100 if not issue_counts.empty else 0
 
-def render_dashboard(result_df: pd.DataFrame):
-    st.subheader("Analysis Results")
+    priority_focus = df[df["priority"] == "High"]["issue_category"].value_counts()
+    if not priority_focus.empty:
+        top_high_issue = priority_focus.index[0]
+        focus_sentence = (
+            f"Among high-priority reviews, the most frequent issue is {top_high_issue}, "
+            "so it should be treated as the first product-improvement focus."
+        )
+    else:
+        focus_sentence = "No high-priority issue cluster was detected in this batch."
 
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Reviews", len(result_df))
-    metric_cols[1].metric("Positive", int((result_df["sentiment"] == "Positive").sum()))
-    metric_cols[2].metric("Negative", int((result_df["sentiment"] == "Negative").sum()))
-    metric_cols[3].metric("High Priority", int((result_df["priority"] == "High").sum()))
+    if "Praise / Strength" in issue_counts.index:
+        praise_count = int(issue_counts.get("Praise / Strength", 0))
+        praise_sentence = (
+            f"The app also identified {praise_count} praise-related reviews that can be used "
+            "to understand product strengths and marketing messages."
+        )
+    else:
+        praise_sentence = (
+            "Praise-related reviews are limited in this batch, so the current analysis is more "
+            "useful for product issue triage."
+        )
 
-    chart_cols = st.columns(3)
-    with chart_cols[0]:
-        sentiment_counts = result_df["sentiment"].value_counts().reset_index()
-        sentiment_counts.columns = ["sentiment", "count"]
-        st.plotly_chart(px.bar(sentiment_counts, x="sentiment", y="count", title="Sentiment"), use_container_width=True)
-    with chart_cols[1]:
-        issue_counts = result_df["issue_category"].value_counts().reset_index()
-        issue_counts.columns = ["issue_category", "count"]
-        st.plotly_chart(px.bar(issue_counts, x="issue_category", y="count", title="Issue Categories"), use_container_width=True)
-    with chart_cols[2]:
-        priority_counts = result_df["priority"].value_counts().reset_index()
-        priority_counts.columns = ["priority", "count"]
-        st.plotly_chart(px.bar(priority_counts, x="priority", y="count", title="Priority"), use_container_width=True)
-
-    st.subheader("Main Takeaways")
-    top_issue = result_df["issue_category"].value_counts().idxmax()
-    negative_rate = (result_df["sentiment"] == "Negative").mean()
-    high_priority_rate = (result_df["priority"] == "High").mean()
-    st.write(
-        f"The most frequent issue category is **{top_issue}**. "
-        f"Negative reviews account for **{negative_rate:.1%}** of the analyzed reviews, "
-        f"and **{high_priority_rate:.1%}** are marked as high priority."
+    return (
+        f"Among {total:,} analyzed reviews, {negative_share:.1f}% are classified as negative. "
+        f"The most frequent issue category is {top_issue}, accounting for {top_issue_share:.1f}% "
+        f"of all analyzed reviews. The app identified {high_priority:,} high-priority reviews "
+        f"that may require developer attention. {focus_sentence} {praise_sentence}"
     )
 
-    st.dataframe(result_df, use_container_width=True, height=420)
-    csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+
+def generate_action_plan(df: pd.DataFrame) -> List[str]:
+    if df.empty:
+        return ["No action plan can be generated because no reviews were analyzed."]
+
+    high_df = df[df["priority"] == "High"]
+    issue_counts = df["issue_category"].value_counts()
+    high_issue_counts = high_df["issue_category"].value_counts()
+
+    plan = []
+
+    if not high_issue_counts.empty:
+        first_issue = high_issue_counts.index[0]
+        plan.append(
+            f"1. Focus first on **{first_issue}**: it is the largest high-priority issue cluster. "
+            f"{get_suggested_action(first_issue)}"
+        )
+    else:
+        first_issue = issue_counts.index[0]
+        plan.append(
+            f"1. Review **{first_issue}** feedback first because it is the most frequent category in this batch. "
+            f"{get_suggested_action(first_issue)}"
+        )
+
+    if len(issue_counts) >= 2:
+        second_issue = issue_counts.index[1]
+        plan.append(
+            f"2. Track **{second_issue}** as the second major review theme. "
+            f"{get_suggested_action(second_issue)}"
+        )
+
+    praise_count = int((df["issue_category"] == "Praise / Strength").sum())
+    if praise_count > 0:
+        plan.append(
+            f"3. Use **Praise / Strength** reviews for marketing: {praise_count} reviews highlight player-perceived strengths."
+        )
+    else:
+        plan.append(
+            "3. Collect more positive and high-confidence reviews to identify stronger store-page selling points."
+        )
+
+    return plan[:3]
+
+
+def render_kpi_cards(df: pd.DataFrame):
+    total = len(df)
+    negative_share = df["sentiment"].apply(is_negative).mean() * 100 if total else 0
+    high_priority = int((df["priority"] == "High").sum()) if total else 0
+    top_issue = df["issue_category"].value_counts().index[0] if total else "N/A"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Reviews", f"{total:,}")
+    c2.metric("Negative Share", f"{negative_share:.1f}%")
+    c3.metric("High Priority", f"{high_priority:,}")
+    c4.metric("Top Issue", top_issue)
+
+
+def render_charts(df: pd.DataFrame):
+    if df.empty:
+        st.info("No data to visualize.")
+        return
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        sentiment_counts = df["sentiment"].value_counts().reset_index()
+        sentiment_counts.columns = ["sentiment", "count"]
+        fig = px.bar(
+            sentiment_counts,
+            x="sentiment",
+            y="count",
+            title="Sentiment Distribution",
+            text="count",
+        )
+        fig.update_layout(xaxis_title="", yaxis_title="Number of Reviews")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        priority_counts = df["priority"].value_counts().reindex(PRIORITY_ORDER).dropna().reset_index()
+        priority_counts.columns = ["priority", "count"]
+        fig = px.bar(
+            priority_counts,
+            x="priority",
+            y="count",
+            title="Priority Distribution",
+            text="count",
+        )
+        fig.update_layout(xaxis_title="", yaxis_title="Number of Reviews")
+        st.plotly_chart(fig, use_container_width=True)
+
+    issue_counts = df["issue_category"].value_counts().reindex(ISSUE_ORDER).dropna().reset_index()
+    issue_counts.columns = ["issue_category", "count"]
+    fig = px.bar(
+        issue_counts,
+        x="issue_category",
+        y="count",
+        title="Issue Category Distribution",
+        text="count",
+    )
+    fig.update_layout(xaxis_title="", yaxis_title="Number of Reviews")
+    st.plotly_chart(fig, use_container_width=True)
+
+    heatmap_data = (
+        df.groupby(["issue_category", "sentiment"])
+        .size()
+        .reset_index(name="count")
+    )
+    if not heatmap_data.empty:
+        pivot = heatmap_data.pivot(
+            index="issue_category",
+            columns="sentiment",
+            values="count",
+        ).fillna(0)
+        pivot = pivot.reindex([x for x in ISSUE_ORDER if x in pivot.index])
+        fig = px.imshow(
+            pivot,
+            text_auto=True,
+            aspect="auto",
+            title="Issue Category × Sentiment Heatmap",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_analysis_results(df: pd.DataFrame):
+    st.subheader("Executive Summary")
+    render_kpi_cards(df)
+    st.write(generate_summary(df))
+
+    st.subheader("Developer Action Plan")
+    for item in generate_action_plan(df):
+        st.markdown(item)
+
+    st.subheader("Visual Dashboard")
+    render_charts(df)
+
+    st.subheader("Detailed Results")
+    st.dataframe(df, use_container_width=True, height=420)
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "Download Results CSV",
-        csv_bytes,
-        file_name="review_analysis_results.csv",
+        label="Download analyzed results as CSV",
+        data=csv_bytes,
+        file_name="analyzed_reviews.csv",
         mime="text/csv",
     )
 
 
-def main():
-    st.title("Game Review Intelligence Assistant")
-    st.caption("Fine-tuned DistilBERT for sentiment classification + TF-IDF Logistic Regression for issue category classification.")
+def fetch_steam_reviews_by_app_id(app_id: str, max_reviews: int = 100, language: str = "english") -> pd.DataFrame:
+    app_id = str(app_id).strip()
+    if not app_id.isdigit():
+        raise ValueError("Steam App ID must be a numeric ID, such as 1086940.")
 
-    with st.sidebar:
-        st.header("Model Settings")
-        st.write("Sentiment model:")
-        st.code(SENTIMENT_MODEL_ID)
-        st.write("Issue classifier:")
-        if ISSUE_MODEL_FILE.exists():
-            st.success("Loaded final_issue_tfidf_logreg.joblib")
+    max_reviews = int(max_reviews)
+    max_reviews = max(1, min(max_reviews, FETCH_MAX_REVIEWS))
+
+    base_url = f"https://store.steampowered.com/appreviews/{app_id}"
+    reviews = []
+    cursor = "*"
+
+    while len(reviews) < max_reviews:
+        params = {
+            "json": 1,
+            "filter": "recent",
+            "language": language,
+            "num_per_page": min(100, max_reviews - len(reviews)),
+            "cursor": cursor,
+            "purchase_type": "all",
+        }
+
+        response = requests.get(
+            base_url,
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Steam request failed with status code {response.status_code}.")
+
+        data = response.json()
+        if not data.get("success"):
+            raise RuntimeError("Steam review endpoint returned an unsuccessful response.")
+
+        batch = data.get("reviews", [])
+        if not batch:
+            break
+
+        for item in batch:
+            review_text = item.get("review", "")
+            if review_text and str(review_text).strip():
+                reviews.append(
+                    {
+                        "review_text": review_text,
+                        "voted_up": item.get("voted_up", None),
+                        "votes_up": item.get("votes_up", 0),
+                        "weighted_vote_score": item.get("weighted_vote_score", 0),
+                        "timestamp_created": item.get("timestamp_created", None),
+                    }
+                )
+
+        new_cursor = data.get("cursor")
+        if not new_cursor or new_cursor == cursor:
+            break
+
+        cursor = new_cursor
+        time.sleep(0.25)
+
+    return pd.DataFrame(reviews).head(max_reviews)
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🎮",
+    layout="wide",
+)
+
+st.title("🎮 Steam Review Intelligence Assistant")
+st.caption(
+    "A developer-oriented review triage tool combining a fine-tuned DistilBERT sentiment model "
+    "with a TF-IDF Logistic Regression issue classifier."
+)
+
+
+try:
+    sentiment_pipe = load_sentiment_model()
+    issue_model, id2issue = load_issue_model()
+except Exception as exc:
+    st.error("Model loading failed. Please check the Hugging Face model ID and local issue model files.")
+    st.info(
+        "Required files: final_issue_tfidf_logreg.joblib and final_issue_label_mapping.csv. "
+        "The sentiment model should be available on Hugging Face."
+    )
+    st.exception(exc)
+    st.stop()
+
+
+tab_single, tab_csv, tab_steam, tab_about = st.tabs(
+    [
+        "Single Review Analyzer",
+        "Batch Review Dashboard",
+        "Fetch by Steam App ID",
+        "About the Model",
+    ]
+)
+
+with tab_single:
+    st.header("Single Review Analyzer")
+    st.write("Paste one review and the app will identify sentiment, issue category, priority, and suggested action.")
+
+    sample_review = (
+        "The game keeps crashing after the latest update and the loading screen freezes every time."
+    )
+    review_text = st.text_area("Review text", value=sample_review, height=160)
+
+    if st.button("Analyze Review", type="primary"):
+        if not review_text.strip():
+            st.warning("Please enter a review first.")
         else:
-            st.warning("Issue TF-IDF model file is missing. Keyword fallback will be used.")
+            with st.spinner("Analyzing review..."):
+                result_df = analyze_texts([review_text], sentiment_pipe, issue_model, id2issue)
+            render_analysis_results(result_df)
 
-    tab_single, tab_csv, tab_steam = st.tabs(["Single Review", "CSV Upload", "Steam App ID"])
 
-    with tab_single:
-        st.subheader("Analyze One Review")
-        review_text = st.text_area("Review text", height=160)
-        if st.button("Analyze Review", type="primary"):
-            if not review_text.strip():
-                st.warning("Please enter a review first.")
-            else:
-                render_dashboard(analyze_reviews([review_text]))
+with tab_csv:
+    st.header("Batch Review Dashboard")
+    st.write("Upload a CSV file with at least one column named `review_text`.")
 
-    with tab_csv:
-        st.subheader("Analyze Uploaded CSV")
-        uploaded = st.file_uploader("Upload a CSV file with a review_text column", type=["csv"])
-        if uploaded is not None:
-            input_df = pd.read_csv(uploaded)
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+    max_rows = st.slider("Maximum rows to analyze", min_value=10, max_value=1000, value=200, step=10)
+
+    if uploaded_file is not None:
+        try:
+            input_df = pd.read_csv(uploaded_file)
             if "review_text" not in input_df.columns:
-                string_cols = input_df.select_dtypes(include=["object"]).columns.tolist()
-                if not string_cols:
-                    st.error("No review_text column or text column found.")
-                else:
-                    selected_col = st.selectbox("Select text column", string_cols)
-                    input_df = input_df.rename(columns={selected_col: "review_text"})
-            if "review_text" in input_df.columns:
-                max_rows = st.slider("Number of rows to analyze", 10, min(1000, len(input_df)), min(200, len(input_df)))
-                if st.button("Analyze CSV", type="primary"):
-                    render_dashboard(analyze_reviews(input_df["review_text"].head(max_rows).tolist()))
-
-    with tab_steam:
-        st.subheader("Fetch Recent English Steam Reviews")
-        st.info("Enter the numeric Steam App ID. For example, in https://store.steampowered.com/app/1086940/..., the App ID is 1086940.")
-        app_id = st.text_input("Steam App ID", value="1086940")
-        num_reviews = st.slider("Number of recent English reviews to fetch", 20, 500, 100, step=20)
-        if st.button("Fetch and Analyze", type="primary"):
-            try:
-                fetched_df = fetch_steam_reviews(app_id.strip(), num_reviews=num_reviews)
-                if fetched_df.empty:
-                    st.warning("No reviews were fetched. Please check the App ID or try again later.")
-                else:
-                    st.write(f"Fetched {len(fetched_df)} reviews.")
-                    render_dashboard(analyze_reviews(fetched_df["review_text"].tolist()))
-            except Exception as exc:
-                st.error("Failed to fetch Steam reviews. Please check the App ID or use CSV upload.")
-                st.exception(exc)
+                st.error("The uploaded CSV must contain a column named `review_text`.")
+            else:
+                input_df = input_df.dropna(subset=["review_text"]).head(max_rows)
+                st.write(f"Loaded {len(input_df):,} reviews for analysis.")
+                if st.button("Analyze Uploaded Reviews", type="primary"):
+                    with st.spinner("Running sentiment and issue category classifiers..."):
+                        result_df = analyze_texts(input_df["review_text"].tolist(), sentiment_pipe, issue_model, id2issue)
+                    render_analysis_results(result_df)
+        except Exception as exc:
+            st.error("Failed to read or analyze the uploaded CSV.")
+            st.exception(exc)
 
 
-if __name__ == "__main__":
-    main()
+with tab_steam:
+    st.header("Fetch Steam Reviews by App ID")
+    st.write(
+        "Enter a numeric Steam App ID. You can find it in the Steam store URL: "
+        "`https://store.steampowered.com/app/1086940/...` → App ID is `1086940`."
+    )
+    st.info(
+        "This feature uses Steam's public review endpoint and may fail if Steam is unavailable or rate-limited. "
+        "For the most stable classroom demo, use CSV upload or fetch 100–200 reviews. Larger runs may take longer."
+    )
+
+    app_id = st.text_input("Steam App ID", value="1086940")
+    review_count = st.selectbox("Number of recent English reviews to fetch", [20, 50, 100, 200, 500, 1000], index=2)
+
+    if review_count >= 500:
+        st.warning("Large fetches analyze more reviews but may take longer on Streamlit Cloud. For live demos, 100–200 is safer.")
+
+    if st.button("Fetch and Analyze Steam Reviews", type="primary"):
+        try:
+            with st.spinner("Fetching recent Steam reviews..."):
+                fetched_df = fetch_steam_reviews_by_app_id(app_id, max_reviews=review_count)
+
+            if fetched_df.empty:
+                st.warning("No reviews found. Please check the App ID or try CSV upload.")
+            else:
+                st.success(f"Fetched {len(fetched_df):,} reviews from Steam App ID {app_id}.")
+
+                with st.spinner("Analyzing fetched reviews..."):
+                    result_df = analyze_texts(fetched_df["review_text"].tolist(), sentiment_pipe, issue_model, id2issue)
+
+                meta_cols = [c for c in fetched_df.columns if c != "review_text"]
+                result_df = pd.concat([result_df, fetched_df[meta_cols].reset_index(drop=True)], axis=1)
+
+                render_analysis_results(result_df)
+
+        except Exception as exc:
+            st.error("Failed to fetch or analyze Steam reviews. Please check the App ID, try a smaller number of reviews, or use CSV upload.")
+            st.exception(exc)
+
+
+with tab_about:
+    st.header("About the Model")
+    st.markdown(
+        """
+### Project purpose
+This app helps developers analyze player reviews by turning unstructured review text into structured feedback.
+
+### Final model selection
+The final system uses two complementary classifiers:
+
+1. **Sentiment Classification**  
+   A fine-tuned DistilBERT model is used to classify reviews as positive/recommended or negative/not recommended.
+
+2. **Issue Category Classification**  
+   A TF-IDF + Logistic Regression model is used as the final issue category classifier.  
+   It was selected because it outperformed the fine-tuned DistilBERT issue model under the limited training setting.
+
+### Issue categories
+The issue classifier predicts one of the following categories:
+- Bug / Crash
+- Multiplayer / Server
+- Performance
+- Gameplay
+- Content
+- Price / Value
+- Praise / Strength
+
+### Important limitation
+The issue category labels were generated through keyword-based weak labeling. Therefore, issue classification should be interpreted as a developer-oriented triage signal rather than perfect human-labeled ground truth.
+
+### Business value
+The app supports:
+- faster review screening,
+- identification of high-priority product issues,
+- detection of player-perceived product strengths,
+- batch-level summaries for product update and community management decisions.
+        """
+    )
