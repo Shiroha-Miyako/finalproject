@@ -286,54 +286,28 @@ def render_interactive_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFram
 
     st.subheader("Interactive Review Explorer")
     st.write(
-        "Use the filters below to focus on a specific issue category, sentiment group, or priority level. "
+        "Select an issue category to focus on related reviews. "
         "The dashboard and detailed results will update automatically without fetching the reviews again."
     )
 
-    col1, col2, col3 = st.columns(3)
-
     issue_options = ["All"] + [x for x in ISSUE_ORDER if x in set(df["issue_category"])]
-    sentiment_options = ["All"] + list(df["sentiment"].dropna().unique())
-    priority_options = ["All"] + [x for x in PRIORITY_ORDER if x in set(df["priority"])]
 
-    with col1:
-        selected_issue = st.selectbox(
-            "Issue Category",
-            issue_options,
-            key=f"{key_prefix}_issue_filter",
-        )
-
-    with col2:
-        selected_sentiment = st.selectbox(
-            "Sentiment",
-            sentiment_options,
-            key=f"{key_prefix}_sentiment_filter",
-        )
-
-    with col3:
-        selected_priority = st.selectbox(
-            "Priority",
-            priority_options,
-            key=f"{key_prefix}_priority_filter",
-        )
+    selected_issue = st.selectbox(
+        "Issue Category",
+        issue_options,
+        key=f"{key_prefix}_issue_filter",
+    )
 
     filtered_df = df.copy()
 
     if selected_issue != "All":
         filtered_df = filtered_df[filtered_df["issue_category"] == selected_issue]
 
-    if selected_sentiment != "All":
-        filtered_df = filtered_df[filtered_df["sentiment"] == selected_sentiment]
-
-    if selected_priority != "All":
-        filtered_df = filtered_df[filtered_df["priority"] == selected_priority]
-
     st.caption(
         f"Showing {len(filtered_df):,} of {len(df):,} analyzed reviews after filtering."
     )
 
     return filtered_df
-
 
 def render_charts(df: pd.DataFrame):
     if df.empty:
